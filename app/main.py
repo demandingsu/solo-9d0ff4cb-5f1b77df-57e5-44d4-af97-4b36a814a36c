@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import service
-from app.database import init_db
+from app.database import init_db, migrate_db
 from app.errors import AppError
 from app.schemas import (
     AnnouncementIn,
@@ -33,6 +33,10 @@ def _db_path() -> str:
 async def lifespan(_: FastAPI):
     path = _db_path()
     init_db(path)
+    # An existing v1 volume is upgraded here, in one transaction; a failed
+    # upgrade leaves the volume usable by the previous service and is
+    # retried on the next startup.
+    migrate_db(path)
     service.ensure_baseline(path)
     yield
 
@@ -47,6 +51,8 @@ app = FastAPI(
         "- 补登需成绩编号、选手、完赛时刻与毫秒用时；撤销仅需成绩编号。\n"
         "- 提交必须指定当前版号；同一版最多发布一份公告。\n"
         "- 补登或撤销后从最早有改动的完赛时刻起重算，旧版始终可按版号回查。\n"
+        "- 每版只新增本次补登/撤销涉及的登记记录，有效成绩不再整版重复存储；"
+        "挂载旧版数据卷启动时自动合并历史快照。\n"
         "- 公告与沿革在同一事务中生效；过期提交或写入失败不会留下部分结果。"
     ),
     lifespan=lifespan,

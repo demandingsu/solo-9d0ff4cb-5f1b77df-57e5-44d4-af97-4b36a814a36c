@@ -5,13 +5,16 @@ Every publish is a single SQLite ``BEGIN IMMEDIATE`` transaction that:
 1. verifies the announcement's base version is still the latest version;
 2. validates all operations against the base snapshot and the global registry;
 3. computes the new progression, reusing the unaffected prefix;
-4. writes the new version, its full snapshot, its progression and its
-   operations, and updates the global registry;
+4. writes the new version, its progression and its operations, and updates
+   the global registry — one inserted row per supplement, one updated row
+   per withdrawal, so storage grows with the operation count only;
 5. commits atomically.
 
-Any validation error, stale base version or write failure rolls the whole
-transaction back, so previously published versions remain exactly as they
-were.
+There is no per-version snapshot of active results: the registry's
+``added_version``/``withdrawn_version`` interval determines the active set
+of every version, so historical versions remain queryable exactly as they
+were.  Any validation error, stale base version or write failure rolls the
+whole transaction back.
 """
 
 from __future__ import annotations
@@ -68,13 +71,23 @@ def ensure_baseline(db_path: str) -> None:
 def _load_snapshot(
     connection: sqlite3.Connection, version: int
 ) -> list[Result]:
+    """Reconstruct the active results of ``version`` from the registry.
+
+    A result is active in exactly the versions ``v`` with
+    ``added_version <= v < withdrawn_version`` (or no withdrawal at all), so
+    the registry — one row per result ever submitted — replaces the old
+    per-version snapshot copies.
+    """
+
     rows = connection.execute(
         """
         SELECT result_id, athlete, finish_time, duration_ms
-        FROM version_results
-        WHERE version = ?
+        FROM results
+        WHERE added_version <= ?
+          AND (withdrawn_version IS NULL OR withdrawn_version > ?)
+        ORDER BY result_id
         """,
-        (version,),
+        (version, version),
     ).fetchall()
     return [
         Result(
@@ -285,24 +298,6 @@ def publish(db_path: str, announcement: AnnouncementIn) -> int:
 
         connection.executemany(
             """
-            INSERT INTO version_results (
-                version, result_id, athlete, finish_time, duration_ms
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    new_version,
-                    item.result_id,
-                    item.athlete,
-                    item.finish_time,
-                    item.duration_ms,
-                )
-                for item in new_results
-            ],
-        )
-
-        connection.executemany(
-            """
             INSERT INTO version_progression (
                 version, seq, kind, result_id, athlete, finish_time, duration_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -399,8 +394,11 @@ def list_versions(db_path: str, offset: int = 0, limit: int = 50) -> list[dict]:
                    v.supplement_count, v.withdrawal_count,
                    (SELECT COUNT(*) FROM version_progression p
                     WHERE p.version = v.version) AS progression_entry_count,
-                   (SELECT COUNT(*) FROM version_results r
-                    WHERE r.version = v.version) AS active_result_count
+                   (SELECT COUNT(*) FROM results r
+                    WHERE r.added_version <= v.version
+                      AND (r.withdrawn_version IS NULL
+                           OR r.withdrawn_version > v.version)
+                   ) AS active_result_count
             FROM versions v
             ORDER BY v.version ASC
             LIMIT ? OFFSET ?

@@ -44,9 +44,13 @@ BASE_URL=http://localhost:8000 ./scripts/selftest.sh
 
 **重算范围**：补登或撤销后，取本次改动涉及的成绩完赛时刻的最小值 `recompute_from_finish_time`（撤销用其在原版中的完赛时刻）。沿革中完赛时刻严格早于该值的条目原样复用（`reused_prefix_entries`），从该时刻起的有效成绩重新分类计算（`recomputed_active_results`）。响应会返回这两个计数和重算起点，便于核对。重算结果与"全量重算"一致（见测试）。
 
-**旧版可查**：每一版都持久化完整快照（有效成绩 + 沿革 + 本次操作）。发布新版不影响任何历史版，`GET /versions/{version}` 随时返回当时的结果。
+**旧版可查**：每一版的沿革与公告操作都按版号持久化；某版的有效成绩由全局登记簿中每条成绩的生效区间（`added_version` ≤ 版号 < `withdrawn_version`）实时重建，与当年整版快照的内容完全一致。发布新版不影响任何历史版，`GET /versions/{version}` 随时返回当时的结果。
 
-**原子性**：校验、快照写入、沿革写入、操作日志写入、全局登记簿更新全部在单个 `BEGIN IMMEDIATE` 事务中完成。提交过期、校验失败或任一写入失败都会整体回滚，已发布版本保持原样。
+**存储去重**：不再为每版另存一整份有效成绩。每发一份公告，登记簿只为本次补登各插入一行、为本次撤销各原地更新一行（写入 `withdrawn_version`），每版新增记录数只随本次补登和撤销的条数增长。撤销从发布撤销公告的版号起生效，被撤销的编号永久保留、拒绝复用。
+
+**原子性**：校验、沿革写入、操作日志写入、全局登记簿更新全部在单个 `BEGIN IMMEDIATE` 事务中完成。提交过期、校验失败或任一写入失败都会整体回滚，已发布版本保持原样。
+
+**数据卷升级**：服务启动时若发现旧版（v1，含整版快照表 `version_results`）数据卷，会在单个事务内完成合并升级：先校验登记簿能逐条重建全部历史快照（成员与字段完全一致），再重建沿革表、删除快照表并写入 `user_version = 2`。升级中断或写入失败会整体回滚——旧版服务仍能使用原数据卷，下次启动自动重试升级。
 
 ## API
 
@@ -95,20 +99,21 @@ app/
   schemas.py       请求/响应模型
   announcement.py  公告校验与纯函数式应用
   progression.py   排序与 first/refresh/tie 分类（支持前缀复用）
-  service.py       事务发布、快照读写、查询
-  database.py      SQLite 连接与表结构
+  service.py       事务发布、按版重建有效成绩、查询
+  database.py      SQLite 连接、表结构与旧卷迁移
   timeutil.py      完赛时刻规范化
-tests/             端到端测试（含回滚与随机对照测试）
+tests/             端到端测试（含回滚、迁移与存储增长测试）
 scripts/selftest.sh 容器内自测脚本
 ```
 
-核心表：
+核心表（schema v2）：
 
 - `versions`：版号、父版号、发布时间、操作计数、重算起点与计数；`parent_version` 唯一索引保证一版最多一个后继。
-- `version_results`：每版的有效成绩快照（含已撤销版中不再存在的结果）。
 - `version_progression`：每版的沿革条目（`seq`、`kind`、`result_id` 等）。
 - `version_operations`：每版公告具体做了什么（补登/撤销及其成绩信息）。
-- `results`：全局登记簿，用于编号唯一性和撤销定位；历史快照不依赖它。
+- `results`：全局登记簿，每条成绩一行，`added_version`/`withdrawn_version` 界定其在哪些版有效；既用于编号唯一性和撤销定位，也用于重建任意版的有效成绩。历史查询不依赖额外快照表。
+
+> v1 数据卷中的 `version_results`（每版整份有效成绩快照）会在启动迁移时合并进上述区间表示并删除；`PRAGMA user_version` 记录数据结构版本。
 
 ## 本地测试
 
