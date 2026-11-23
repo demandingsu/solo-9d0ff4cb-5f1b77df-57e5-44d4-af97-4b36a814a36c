@@ -1,0 +1,15 @@
+services:
+  records:
+    build: .
+    image: women1500-records:latest
+    container_name: women1500-records
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB_PATH: /data/records.db
+    volumes:
+      - records-data:/data
+    restart: unless-stopped
+
+volumes:
+  records-data:
